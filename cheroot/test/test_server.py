@@ -1,5 +1,7 @@
 """Tests for the HTTP server."""
 
+from __future__ import annotations
+
 import os
 import pathlib
 import queue
@@ -8,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
+import typing as _t
 import urllib.parse  # noqa: WPS301
 import uuid
 from http import HTTPStatus
@@ -44,6 +48,18 @@ non_macos_sock_test = pytest.mark.skipif(
     IS_MACOS,
     reason='Peercreds lookup does not work under macOS/BSD currently.',
 )
+
+
+def _wait_until(
+    *,
+    compute_condition: _t.Callable[[], bool],
+    timeout: float = 10,
+) -> bool:
+    """Wait until the condition is true or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while not compute_condition() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return compute_condition()
 
 
 @pytest.fixture(params=('abstract', 'file'))
@@ -82,6 +98,18 @@ def unix_file_sock():
 
     os.close(tmp_sock_fh)
     os.unlink(tmp_sock_fname)
+
+
+def _make_server(
+    server_class: type[HTTPServer] = HTTPServer,
+    **kwargs: _t.Any,
+) -> HTTPServer:
+    """Make a server on an ephemeral port, without starting it."""
+    return server_class(
+        bind_addr=(ANY_INTERFACE_IPV4, EPHEMERAL_PORT),
+        gateway=Gateway,
+        **kwargs,
+    )
 
 
 def test_prepare_makes_server_ready():
@@ -581,6 +609,72 @@ def test_threadpool_multistart_validation(monkeypatch):
         match='Threadpools can only be started once.',
     ):
         tp.start()
+
+
+def _prepared_pool(
+    request: pytest.FixtureRequest,
+    *,
+    minthreads: int,
+) -> ThreadPool:
+    """Prepare a server with a set number of threads, and return its pool."""
+    httpserver = _make_server(minthreads=minthreads)
+    httpserver.prepare()
+    request.addfinalizer(httpserver.stop)
+    return httpserver.requests
+
+
+def _count_live_threads(pool: ThreadPool) -> int:
+    """Count the pool's threads that have not exited yet."""
+    return sum(thread.is_alive() for thread in pool._threads)
+
+
+def test_threadpool_shrink_calls_are_additive(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Test two close-together shrink() calls retire the total requested."""
+    pool = _prepared_pool(request, minthreads=1)
+    pool.grow(20)
+    pool.shrink(10)
+    pool.shrink(10)
+    assert pool.idle == 1
+    assert _wait_until(
+        compute_condition=lambda: _count_live_threads(pool) == 1,
+    )
+
+
+def test_threadpool_shrink_keeps_minimum(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Test that shrink() keeps the minimum number of threads."""
+    pool = _prepared_pool(request, minthreads=10)
+    pool.grow(40)
+    pool.shrink(40)
+    pool.shrink(80)
+    assert pool.idle == 10
+    assert _wait_until(
+        compute_condition=lambda: _count_live_threads(pool) == 10,
+    )
+    assert pool.qsize == 0
+
+
+def test_threadpool_interrupted_shrink_leaves_nothing_pending(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that a shrink() whose request is not queued counts no shutdown."""
+    pool = _prepared_pool(request, minthreads=1)
+    pool.grow(1)
+
+    def _interrupted_put(*_args: object, **_kwargs: object) -> None:
+        # Such as a KeyboardInterrupt while waiting for room in the queue
+        raise RuntimeError('interrupted')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pool._queue, 'put', _interrupted_put)
+        with pytest.raises(RuntimeError, match='interrupted'):
+            pool.shrink(1)
+    assert not pool._pending_shutdowns
+    assert pool.idle == 2
 
 
 def test_overload_results_in_suitable_http_error(request):

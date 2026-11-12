@@ -338,16 +338,21 @@ class ThreadPool:
         return worker
 
     def shrink(self, amount):
-        """Kill off worker threads (not below self.min)."""
+        """Kill off worker threads (not below self.min).
+
+        Ask up to ``amount`` more threads to shut down. Threads that earlier
+        calls already asked to shut down count as gone, as in :py:attr:`idle`.
+        """
         # Grow/shrink the pool if necessary.
         # Remove any dead threads from our list
-        amount -= len(self._pending_shutdowns)
         self._clear_dead_threads()
-        if amount <= 0:
-            return
 
-        # calculate the number of threads above the minimum
-        n_extra = max(len(self._threads) - self.min, 0)
+        # calculate the number of threads above the minimum that are not
+        # already shutting down
+        n_extra = max(
+            len(self._threads) - len(self._pending_shutdowns) - self.min,
+            0,
+        )
 
         # don't remove more than amount
         n_to_remove = min(amount, n_extra)
@@ -356,8 +361,9 @@ class ThreadPool:
         # to remove. As each request is processed by a worker, that worker
         # will terminate and be culled from the list.
         for _ in range(n_to_remove):
-            self._pending_shutdowns.append(None)
             self._queue.put(_SHUTDOWNREQUEST)
+            # only once queued: an interrupted put() leaves nothing pending
+            self._pending_shutdowns.append(None)
 
     def stop(self, timeout=5):
         """Terminate all worker threads.
