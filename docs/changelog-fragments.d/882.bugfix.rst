@@ -1,0 +1,6 @@
+Fixed :py:meth:`ThreadPool.stop() <cheroot.workers.threadpool.ThreadPool.stop>`
+leaving shutdown requests queued when it stopped a pool that was still
+in the process of shrinking, or one that its own worker stopped on an
+interrupt. Those leftover requests made starting the pool again hang.
+
+-- by :user:`rm-you`

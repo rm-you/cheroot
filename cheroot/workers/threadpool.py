@@ -399,6 +399,7 @@ class ThreadPool:
             KeyboardInterrupt,
         )
 
+        threads = self._threads[:]
         for worker in self._clear_threads():
             remaining_time = timeout and endtime - time.time()
             try:
@@ -409,6 +410,42 @@ class ThreadPool:
                     worker.join()
             except ignored_errors:
                 pass
+
+        # Some threads run on and take their requests later: one whose join
+        # was interrupted, and a worker that stops its own pool while it
+        # handles a connection. A worker that stops it on an interrupt holds
+        # no connection, and exits without taking one.
+        current_thread = threading.current_thread()
+        n_running = len(
+            [
+                thread
+                for thread in threads
+                if thread.is_alive()
+                and (thread is not current_thread or thread.conn is not None)
+            ],
+        )
+
+        # A thread that shrink() had already asked to shut down took only one
+        # of its two requests. The others would retire the threads of a
+        # restarted pool, so drop them, and the pending shutdowns too.
+        self._drop_shutdown_requests(keep=n_running)
+        self._pending_shutdowns.clear()
+
+    def _drop_shutdown_requests(self, keep):
+        """Drop the queued shutdown requests but ``keep`` of them."""
+        queued = []
+        # A thread that runs on may take from the queue meanwhile
+        while True:
+            try:
+                queued.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        for item in queued:
+            if item is _SHUTDOWNREQUEST:
+                if not keep:
+                    continue
+                keep -= 1
+            self._queue.put_nowait(item)
 
     @staticmethod
     @pass_none
