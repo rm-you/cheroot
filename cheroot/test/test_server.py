@@ -1,6 +1,10 @@
 """Tests for the HTTP server."""
 
+from __future__ import annotations
+
+import errno
 import gc
+import logging
 import os
 import pathlib
 import queue
@@ -10,8 +14,10 @@ import sys
 import tempfile
 import threading
 import types
+import typing as _t
 import urllib.parse  # noqa: WPS301
 import uuid
+import weakref
 from http import HTTPStatus
 
 import pytest
@@ -19,7 +25,15 @@ import pytest
 import requests
 import requests_unixsocket
 
-from .._compat import IS_LINUX, IS_MACOS, IS_WINDOWS, SYS_PLATFORM, bton, ntob
+from .._compat import (
+    IS_LINUX,
+    IS_MACOS,
+    IS_PYPY,
+    IS_WINDOWS,
+    SYS_PLATFORM,
+    bton,
+    ntob,
+)
 from ..server import IS_UID_GID_RESOLVABLE, Gateway, HTTPServer
 from ..testing import (
     ANY_INTERFACE_IPV4,
@@ -82,6 +96,18 @@ def unix_file_sock():
 
     os.close(tmp_sock_fh)
     os.unlink(tmp_sock_fname)
+
+
+def _make_server(
+    server_class: type[HTTPServer] = HTTPServer,
+    **kwargs: _t.Any,
+) -> HTTPServer:
+    """Make a server on an ephemeral port, without starting it."""
+    return server_class(
+        bind_addr=(ANY_INTERFACE_IPV4, EPHEMERAL_PORT),
+        gateway=Gateway,
+        **kwargs,
+    )
 
 
 def test_prepare_makes_server_ready():
@@ -627,3 +653,69 @@ def test_overload_thread_does_not_leak():
     # We use special exit code to indicate success, rather than normal zero, so
     # the test doesn't acidentally pass:
     assert process.returncode == SUCCESSFUL_SUBPROCESS_EXIT
+
+
+def test_statistics_are_published_while_serving(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Test that a server's statistics are published only while it serves."""
+    httpserver = _make_server()
+    stats_key = f'Cheroot HTTPServer {id(httpserver)}'
+    assert stats_key not in logging.statistics
+
+    httpserver.prepare()
+    request.addfinalizer(httpserver.stop)
+    assert logging.statistics[stats_key] is httpserver.stats
+    httpserver.clear_stats()
+    assert logging.statistics[stats_key] is httpserver.stats
+
+    httpserver.stop()
+    assert stats_key not in logging.statistics
+
+    httpserver.prepare()
+    assert logging.statistics[stats_key] is httpserver.stats
+
+
+@pytest.mark.parametrize(
+    'lifecycle',
+    (
+        'never started',
+        'failed to bind',
+        pytest.param(
+            'stopped',
+            marks=pytest.mark.xfail(
+                IS_PYPY,
+                reason='Under PyPy, coverage.py traces in Python and keeps '
+                'every thread that it traced, which holds the server',
+                # NOTE: Without coverage.py, the server is collected and the
+                # NOTE: test passes, which a strict mark would turn into a
+                # NOTE: failure.
+                strict=False,
+            ),
+        ),
+    ),
+)
+def test_discarded_server_is_collected(
+    lifecycle: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that the statistics registry keeps no discarded server alive."""
+    httpserver = _make_server()
+    if lifecycle == 'failed to bind':
+
+        def _fail_bind(*_args: object) -> None:
+            raise OSError(errno.EADDRINUSE, 'Address already in use')
+
+        # Patch the class: patching the instance would keep it alive
+        monkeypatch.setattr(HTTPServer, 'bind', _fail_bind)
+        with pytest.raises(OSError, match='No socket could be created'):
+            httpserver.prepare()
+    elif lifecycle == 'stopped':
+        httpserver.prepare()
+        httpserver.stop()
+    server_ref = weakref.ref(httpserver)
+
+    del httpserver  # noqa: WPS420
+    for _ in range(3):
+        gc.collect()
+    assert server_ref() is None
