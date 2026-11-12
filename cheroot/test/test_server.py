@@ -15,6 +15,7 @@ import types
 import typing as _t
 import urllib.parse  # noqa: WPS301
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 
 import pytest
@@ -23,6 +24,7 @@ import requests
 import requests_unixsocket
 from pypytools.gc.custom import DefaultGc
 
+from .. import wsgi
 from .._compat import IS_LINUX, IS_MACOS, IS_WINDOWS, SYS_PLATFORM, bton, ntob
 from ..server import IS_UID_GID_RESOLVABLE, Gateway, HTTPServer
 from ..testing import (
@@ -32,6 +34,7 @@ from ..testing import (
     SUCCESSFUL_SUBPROCESS_EXIT,
 )
 from ..workers.threadpool import ThreadPool
+from . import webtest
 
 
 IS_SLOW_ENV = IS_MACOS or IS_WINDOWS
@@ -505,6 +508,15 @@ def many_open_sockets(request, resource_limit):
             test_socket.close()
 
 
+def _make_wsgi_server(app: _t.Callable[..., _t.Any]) -> wsgi.Server:
+    """Make a WSGI server with one worker on an ephemeral port."""
+    return wsgi.Server(
+        (ANY_INTERFACE_IPV4, EPHEMERAL_PORT),
+        app,
+        numthreads=1,
+    )
+
+
 @pytest.mark.parametrize(
     ('minthreads', 'maxthreads', 'inited_maxthreads'),
     (
@@ -675,6 +687,138 @@ def test_threadpool_interrupted_shrink_leaves_nothing_pending(
             pool.shrink(1)
     assert not pool._pending_shutdowns
     assert pool.idle == 2
+
+
+@pytest.mark.parametrize('shrinking', ('done', 'in progress'))
+def test_threadpool_restarts_after_stop(
+    request: pytest.FixtureRequest,
+    shrinking: str,
+) -> None:
+    """Test that a pool stopped after or during shrinking restarts."""
+    pool = _prepared_pool(request, minthreads=2)
+    pool.grow(5)
+    pool.shrink(5)
+    if shrinking == 'done':
+        assert _wait_until(
+            compute_condition=lambda: _count_live_threads(pool) == 2,
+        )
+    pool.stop()
+    # A leftover request would retire a restarted thread, and a leftover
+    # pending shutdown would hide the restarted threads from idle
+    assert pool.qsize == 0
+    assert not pool._pending_shutdowns
+    pool.start()
+    assert pool.idle == 2
+
+
+def test_threadpool_stop_ends_threads_whatever_is_pending(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Test that stop() ends every thread even if a request went missing."""
+    pool = _prepared_pool(request, minthreads=2)
+    # A pending shutdown whose request never reached the queue
+    pool._pending_shutdowns.append(None)
+    # Stop in a thread, so that a thread left waiting for a request fails
+    # the test instead of hanging the run
+    stopper = threading.Thread(target=pool.stop, daemon=True)
+    stopper.start()
+    stopper.join(10)
+    assert not stopper.is_alive()
+    assert pool.qsize == 0
+
+
+def test_threadpool_stopped_by_its_own_worker() -> None:
+    """Test that a worker that stops its own pool still exits."""
+
+    def app(
+        _environ: dict[str, _t.Any],
+        start_response: _t.Callable[..., _t.Any],
+    ) -> list[bytes]:
+        server.requests.stop()
+        start_response('200 OK', [('Content-Length', '2')])
+        return [b'ok']
+
+    server = _make_wsgi_server(app)
+    with server._run_in_thread():
+        workers = list(server.requests._threads)
+        host = webtest.interface(ANY_INTERFACE_IPV4)
+        response = requests.get(
+            f'http://{host}:{server.bind_addr[1]}/',
+            headers={'Connection': 'close'},
+            timeout=10,
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert _wait_until(
+            compute_condition=lambda: (
+                not any(worker.is_alive() for worker in workers)
+            ),
+        )
+        assert server.requests.qsize == 0
+
+
+def test_threadpool_stopped_on_interrupt_by_its_own_worker() -> None:
+    """Test that a worker that interrupts its server leaves no request."""
+
+    def app(
+        _environ: dict[str, _t.Any],
+        _start_response: _t.Callable[..., _t.Any],
+    ) -> list[bytes]:
+        raise KeyboardInterrupt('simulated test handler keyboard interrupt')
+
+    server = _make_wsgi_server(app)
+    with server._run_in_thread() as serve_thread:
+        host = webtest.interface(ANY_INTERFACE_IPV4)
+        with pytest.raises(requests.ConnectionError):
+            requests.get(
+                f'http://{host}:{server.bind_addr[1]}/',
+                headers={'Connection': 'close'},
+                timeout=10,
+            )
+        serve_thread.join(10)
+        assert not serve_thread.is_alive()
+    # The worker exits without taking a request, so none is kept for it
+    assert server.requests.qsize == 0
+
+
+def test_threadpool_interrupted_stop_lets_running_threads_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that a thread still running after an interrupted stop() exits."""
+    release = threading.Event()
+
+    def app(
+        _environ: dict[str, _t.Any],
+        start_response: _t.Callable[..., _t.Any],
+    ) -> list[bytes]:
+        release.wait(10)
+        start_response('200 OK', [('Content-Length', '2')])
+        return [b'ok']
+
+    server = _make_wsgi_server(app)
+    with server._run_in_thread():
+        worker = server.requests._threads[0]
+        host = webtest.interface(ANY_INTERFACE_IPV4)
+        with ThreadPoolExecutor(max_workers=1) as client:
+            response = client.submit(
+                requests.get,
+                f'http://{host}:{server.bind_addr[1]}/',
+                headers={'Connection': 'close'},
+                timeout=10,
+            )
+            assert _wait_until(
+                compute_condition=lambda: worker.conn is not None,
+            )
+
+            def _interrupted_join(*_args: object) -> None:
+                # Such as a second Ctrl-C while stop() waits for the thread
+                raise KeyboardInterrupt
+
+            with monkeypatch.context() as patch:
+                patch.setattr(worker, 'join', _interrupted_join)
+                server.requests.stop()
+            release.set()
+            assert response.result().status_code == HTTPStatus.OK
+        assert _wait_until(compute_condition=lambda: not worker.is_alive())
 
 
 def test_overload_results_in_suitable_http_error(request):
