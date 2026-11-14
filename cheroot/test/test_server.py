@@ -974,8 +974,8 @@ def test_threadpool_unneeded_shrink_request_keeps_threads(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A shrink request that its call cancelled must not end a thread."""
-    # Workers wait until the interrupted call has cancelled its request
+    """A shrink request that its call canceled must not end a thread."""
+    # Workers wait until the interrupted call has canceled its request
     with _paused_workers(monkeypatch):
         pool = _prepared_pool(request, minthreads=1)
         pool.grow(2)
