@@ -9,9 +9,7 @@ class TrueyZero:
 
 trueyzero: TrueyZero
 
-class _ShrinkRequest:
-    taken: bool
-    cancelled: bool
+class _ShrinkRequest: ...
 
 class WorkerThread(threading.Thread):
     conn: _t.Any
@@ -34,7 +32,7 @@ class ThreadPool:
     max: _t.Any
     get: _t.Any
     _lock: threading.Lock
-    _shutdowns_due: int
+    _shutdowns_due: set[_ShrinkRequest]
     def __init__(
         self,
         server,
@@ -50,7 +48,6 @@ class ThreadPool:
     def grow(self, amount) -> None: ...
     def shrink(self, amount) -> None: ...
     def _serving(self) -> list[WorkerThread]: ...
-    def _cancel(self, requests: list[_ShrinkRequest]) -> None: ...
     def _retires(
         self,
         worker: WorkerThread,

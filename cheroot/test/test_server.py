@@ -722,6 +722,41 @@ def test_threadpool_workers_do_not_check_other_threads(
     assert not callers
 
 
+class _LockInterruptedOnRelease:
+    """The pool's lock, interrupted once as it is released."""
+
+    def __init__(self, pool: ThreadPool) -> None:
+        self._lock = pool._lock
+        self._interrupted = False
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self._lock.release()
+        if not self._interrupted:
+            self._interrupted = True
+            raise KeyboardInterrupt
+
+
+def test_threadpool_shrink_interrupted_after_its_reservation(
+    single_thread_pool: ThreadPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shrink() interrupted before it queues gives its shutdown back."""
+    pool = single_thread_pool
+    pool.grow(3)
+    with monkeypatch.context() as patch:
+        # Right after it reserved the shutdowns
+        patch.setattr(pool, '_lock', _LockInterruptedOnRelease(pool))
+        with pytest.raises(KeyboardInterrupt):
+            pool.shrink(5)
+    # No shutdown is due, so every thread counts as idle
+    assert pool.idle == 4
+    pool.shrink(5)
+    assert _wait_for_thread_count(pool, pool.min)
+
+
 @pytest.mark.parametrize('queued_before_error', (0, 1))
 def test_threadpool_interrupted_shrink_releases_unused_reservations(
     request: pytest.FixtureRequest,
@@ -747,7 +782,7 @@ def test_threadpool_interrupted_shrink_releases_unused_reservations(
             patch.setattr(pool._queue, 'put', _interrupted_put)
             with pytest.raises(RuntimeError, match='interrupted'):
                 pool.shrink(2)
-        assert pool._shutdowns_due == queued_before_error
+        assert len(pool._shutdowns_due) == queued_before_error
         assert pool.idle == 3 - queued_before_error
 
     pool.shrink(3)

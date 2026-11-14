@@ -34,13 +34,7 @@ _SHUTDOWNREQUEST = object()
 
 
 class _ShrinkRequest:
-    """A request that shrink() queued for one thread to shut down."""
-
-    taken = False
-    """Whether a worker took it, so that its shutdown is no longer due."""
-
-    cancelled = False
-    """Whether its shrink() call gave its shutdown back before then."""
+    """A request that shrink() queues for one thread to shut down."""
 
 
 class WorkerThread(threading.Thread):
@@ -307,10 +301,10 @@ class ThreadPool:
         self._queue = queue.Queue(maxsize=accepted_queue_size)
         self._queue_put_timeout = accepted_queue_timeout
         self.get = self._queue.get
-        # Guards the number of shutdowns that shrink() asked for and that
-        # no thread has taken yet, and which threads take them
+        # Guards the requests of shrink() that no thread has taken yet,
+        # whose shutdowns are due, and which threads take them
         self._lock = threading.Lock()
-        self._shutdowns_due = 0
+        self._shutdowns_due = set()
 
     def start(self):
         """Start the pool of threads.
@@ -328,7 +322,7 @@ class ThreadPool:
         # takes a shrink request
         with self._lock:
             idles = len([t for t in self._serving() if t.conn is None])
-            return max(idles - self._shutdowns_due, 0)
+            return max(idles - len(self._shutdowns_due), 0)
 
     def put(self, obj):
         """Put request into queue.
@@ -373,50 +367,47 @@ class ThreadPool:
 
         Threads that earlier calls asked to shut down count as gone.
         """
-        with self._lock:
-            # Remove any dead threads from our list
-            self._clear_dead_threads()
-
-            # calculate the number of threads above the minimum, without
-            # those that earlier calls asked to shut down
-            n_removable = max(
-                len(self._serving()) - self._shutdowns_due - self.min,
-                0,
-            )
-
-            # don't remove more than amount
-            n_to_remove = min(amount, n_removable)
-            # Count them as due before they're queued, so that a concurrent
-            # shrink() call sees them and doesn't pick the same threads
-            self._shutdowns_due += n_to_remove
-
-        # put a request on the queue for each shutdown
-        requests = [_ShrinkRequest() for _ in range(n_to_remove)]
+        requests = []
         n_queued = 0
         try:
+            with self._lock:
+                # Remove any dead threads from our list
+                self._clear_dead_threads()
+
+                # calculate the number of threads above the minimum,
+                # without those that earlier calls asked to shut down
+                n_removable = max(
+                    len(self._serving()) - len(self._shutdowns_due) - self.min,
+                    0,
+                )
+
+                # don't remove more than amount
+                requests = [
+                    _ShrinkRequest() for _ in range(min(amount, n_removable))
+                ]
+                # Count them as due before they're queued, so that a
+                # concurrent shrink() call sees them and doesn't pick the
+                # same threads
+                self._shutdowns_due.update(requests)
+
+            # put a request on the queue for each shutdown
             for request in requests:
                 self._queue.put(request)
                 n_queued += 1
         finally:
-            self._cancel(requests[n_queued:])
-
-    def _cancel(self, requests):
-        """Give back the shutdowns of requests that no worker has taken."""
-        # A put() was interrupted, such as while it waited for room, maybe
-        # after its request got into the queue, where a worker skips it now
-        with self._lock:
-            for request in requests:
-                if not request.taken:
-                    request.cancelled = True
-                    self._shutdowns_due -= 1
+            # If this was interrupted, such as while put() waited for room,
+            # give back the shutdowns of its requests that are not queued,
+            # or that got in as put() was interrupted: a worker skips them
+            with self._lock:
+                self._shutdowns_due.difference_update(requests[n_queued:])
 
     def _retires(self, worker, request):
         """Tell whether a worker that took a shrink request shuts down."""
         with self._lock:
-            if request.cancelled:
+            # Its shrink() call may have given its shutdown back
+            if request not in self._shutdowns_due:
                 return False
-            request.taken = True
-            self._shutdowns_due -= 1
+            self._shutdowns_due.remove(request)
             # Another thread may have exited since shrink() was called
             if len(self._serving()) <= self.min:
                 return False
