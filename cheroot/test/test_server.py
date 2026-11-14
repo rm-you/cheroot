@@ -717,7 +717,8 @@ def test_threadpool_workers_do_not_check_other_threads(
     monkeypatch.setattr(WorkerThread, 'is_alive', _recorded_is_alive)
     pool.grow(3)
     pool.shrink(3)
-    assert _wait_for_empty_queue(pool)
+    # Once they have exited, the workers have handled their requests
+    assert _wait_for_thread_count(pool, pool.min)
     assert not pool._shutdowns_due
     assert not callers
 
