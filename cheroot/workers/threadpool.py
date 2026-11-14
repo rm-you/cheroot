@@ -502,6 +502,15 @@ class ThreadPool:
         for _ in range(n_running):
             self._queue.put_shutdown(_SHUTDOWNREQUEST)
 
+        self._wait_for(threads, timeout, endtime)
+
+        with self._lock:
+            # A thread still running, even this one, keeps the pool from
+            # starting again: a new thread could take its stop request
+            self._threads[:] = [t for t in self._threads if t.ready]
+
+    def _wait_for(self, threads, timeout, endtime):
+        """Wait for threads to exit, closing connections after the timeout."""
         ignored_errors = (
             # Raised when start_response called >1 time w/o exc_info or
             # wsgi write is called before start_response. See cheroot#261
@@ -510,10 +519,15 @@ class ThreadPool:
             KeyboardInterrupt,
         )
 
-        # A thread of the pool that stops it waits for no thread: another
-        # one may be stopping the pool too, and waiting for this one
-        if threading.current_thread() in threads:
-            threads = []
+        # A thread of the pool that stops it waits no longer than the
+        # timeout, and not at all without one: another thread may be
+        # stopping the pool too, and waiting for this one
+        current_thread = threading.current_thread()
+        from_worker = current_thread in threads
+        if from_worker:
+            threads.remove(current_thread)
+            if timeout is None:
+                return
         for worker in threads:
             remaining_time = timeout and endtime - time.time()
             try:
@@ -521,14 +535,10 @@ class ThreadPool:
                 if worker.is_alive():
                     # Timeout exhausted; forcibly shut down the socket.
                     self._force_close(worker.conn)
-                    worker.join()
+                    if not from_worker:
+                        worker.join()
             except ignored_errors:
                 pass
-
-        with self._lock:
-            # A thread still running, even this one, keeps the pool from
-            # starting again: a new thread could take its stop request
-            self._threads[:] = [t for t in self._threads if t.ready]
 
     @staticmethod
     @pass_none

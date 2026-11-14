@@ -1710,6 +1710,27 @@ def test_threadpool_workers_that_stop_their_pool_at_once(
     )
 
 
+def test_threadpool_worker_that_stops_its_pool_closes_stuck_connections(
+    request: pytest.FixtureRequest,
+) -> None:
+    """A worker that stops its pool still closes a stuck thread's connection."""
+    pool = _pool_of_daemon_threads(request, minthreads=2)
+    stuck = _HeldConnection()
+    pool.put(stuck)
+    assert _wait_until(
+        compute_condition=lambda: any(t.conn is stuck for t in pool._threads),
+    )
+    stopping = _StoppingConnection(pool)
+    stopping.closed.set()
+    pool.put(stopping)
+    assert stopping.stopped.wait(10)
+    # Its stop() had a timeout of 0, after which it closes the connection
+    assert stuck.closed.is_set()
+    assert _wait_until(
+        compute_condition=lambda: not any(t.is_alive() for t in pool._threads),
+    )
+
+
 def test_threadpool_restart_waits_for_a_worker_that_stopped_it(
     request: pytest.FixtureRequest,
 ) -> None:
