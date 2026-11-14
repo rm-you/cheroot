@@ -334,6 +334,8 @@ class ThreadPool:
         :raises RuntimeError: if the pool is already started
         """
         with self._lock:
+            # Forget the threads that have exited since stop()
+            self._threads[:] = [t for t in self._threads if t.ready]
             if self._threads:
                 raise RuntimeError('Threadpools can only be started once.')
             self._grow(self.min)
@@ -510,8 +512,7 @@ class ThreadPool:
 
         # A thread of the pool that stops it waits for no thread: another
         # one may be stopping the pool too, and waiting for this one
-        current_thread = threading.current_thread()
-        if current_thread in threads:
+        if threading.current_thread() in threads:
             threads = []
         for worker in threads:
             remaining_time = timeout and endtime - time.time()
@@ -525,13 +526,9 @@ class ThreadPool:
                 pass
 
         with self._lock:
-            # A thread still running keeps the pool from starting again,
-            # unless it is this one, which exits after its connection
-            self._threads[:] = [
-                t
-                for t in self._threads
-                if t.is_alive() and t is not current_thread
-            ]
+            # A thread still running, even this one, keeps the pool from
+            # starting again: a new thread could take its stop request
+            self._threads[:] = [t for t in self._threads if t.ready]
 
     @staticmethod
     @pass_none

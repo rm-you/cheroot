@@ -1710,6 +1710,24 @@ def test_threadpool_workers_that_stop_their_pool_at_once(
     )
 
 
+def test_threadpool_restart_waits_for_a_worker_that_stopped_it(
+    request: pytest.FixtureRequest,
+) -> None:
+    """A pool that its worker stopped starts again once that worker exits."""
+    pool = _pool_of_daemon_threads(request, minthreads=1)
+    worker = pool._threads[0]
+    connection = _StoppingConnection(pool)
+    pool.put(connection)
+    assert connection.stopped.wait(10)
+    # A new thread could take the request that this one still needs
+    with pytest.raises(RuntimeError, match='can only be started once'):
+        pool.start()
+    connection.closed.set()
+    assert _wait_until(compute_condition=lambda: not worker.is_alive())
+    pool.start()
+    assert pool.idle == pool.min
+
+
 def test_threadpool_grow_while_stopping_is_refused(
     single_thread_pool: ThreadPool,
     monkeypatch: pytest.MonkeyPatch,
