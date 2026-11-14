@@ -37,6 +37,19 @@ class _ShrinkRequest:
     """A request that shrink() queues for one thread to shut down."""
 
 
+class _RequestQueue(queue.Queue):
+    """A queue of connections, and of requests for workers to shut down."""
+
+    def put_shutdown(self, request):
+        """Queue a shutdown request, even when the queue has no room."""
+        # stop() then always reaches its timeout, which closes the
+        # connection that a worker may be stuck on
+        with self.not_empty:
+            self._put(request)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
 class WorkerThread(threading.Thread):
     """Thread which continuously polls a Queue for Connection objects.
 
@@ -304,7 +317,7 @@ class ThreadPool:
         self.min = min
         self.max = max
         self._threads = []
-        self._queue = queue.Queue(maxsize=accepted_queue_size)
+        self._queue = _RequestQueue(maxsize=accepted_queue_size)
         self._queue_put_timeout = accepted_queue_timeout
         self.get = self._queue.get
         # Guards the requests of shrink() that no thread has taken yet,
@@ -475,7 +488,7 @@ class ThreadPool:
         # Must shut down threads here so the code that calls
         # this method can know when all threads are stopped.
         for _ in range(n_running):
-            self._queue.put(_SHUTDOWNREQUEST)
+            self._queue.put_shutdown(_SHUTDOWNREQUEST)
 
         ignored_errors = (
             # Raised when start_response called >1 time w/o exc_info or

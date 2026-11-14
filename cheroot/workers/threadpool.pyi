@@ -1,3 +1,4 @@
+import queue
 import threading
 import typing as _t
 
@@ -10,6 +11,9 @@ class TrueyZero:
 trueyzero: TrueyZero
 
 class _ShrinkRequest: ...
+
+class _RequestQueue(queue.Queue[_t.Any]):
+    def put_shutdown(self, request: object) -> None: ...
 
 class WorkerThread(threading.Thread):
     conn: _t.Any
