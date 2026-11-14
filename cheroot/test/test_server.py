@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import gc
 import os
 import pathlib
@@ -1640,6 +1641,73 @@ def test_threadpool_overlapping_stops_end_every_thread(
         stopper.join(10)
     assert not any(stopper.is_alive() for stopper in stoppers)
     assert not any(worker.is_alive() for worker in workers)
+
+
+def _pool_of_daemon_threads(
+    request: pytest.FixtureRequest,
+    *,
+    minthreads: int,
+) -> ThreadPool:
+    """Start a pool whose threads do not keep the tests from ending.
+
+    Threads inherit their daemon flag, so starting the pool from a daemon
+    thread makes a regression that leaves threads waiting fail the test
+    instead of hanging the run.
+    """
+    pool = ThreadPool(_make_server(), min=minthreads)
+    pool.server.requests = pool
+    starter = threading.Thread(target=pool.start, daemon=True)
+    starter.start()
+    _join_thread(starter)
+    request.addfinalizer(functools.partial(_stop_in_daemon, pool))
+    return pool
+
+
+def _stop_in_daemon(pool: ThreadPool) -> None:
+    """Stop a pool without waiting more than a few seconds for it."""
+    threading.Thread(target=pool.stop, daemon=True).start()
+
+
+class _StoppingConnection(_HeldConnection):
+    """A connection whose handler stops the pool, then waits to be closed."""
+
+    def __init__(self, pool: ThreadPool) -> None:
+        super().__init__()
+        self.stopped = threading.Event()
+        self._pool = pool
+
+    def communicate(self) -> bool:
+        """Stop the pool, then handle the connection until it is closed."""
+        self._pool.stop(timeout=0)
+        self.stopped.set()
+        return super().communicate()
+
+
+def test_threadpool_workers_that_stop_their_pool_at_once(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two workers that stop their pool at once do not wait for each other."""
+    pool = _pool_of_daemon_threads(request, minthreads=2)
+    workers = list(pool._threads)
+    put_shutdown = pool._queue.put_shutdown
+    together = threading.Barrier(2)
+
+    def _put_together(obj: object) -> None:
+        # Each stop() has counted both threads before either goes on
+        with contextlib.suppress(threading.BrokenBarrierError):
+            together.wait(timeout=5)
+        put_shutdown(obj)
+
+    monkeypatch.setattr(pool._queue, 'put_shutdown', _put_together)
+    connections = [_StoppingConnection(pool) for _ in workers]
+    for connection in connections:
+        connection.closed.set()
+        pool.put(connection)
+    assert all(connection.stopped.wait(10) for connection in connections)
+    assert _wait_until(
+        compute_condition=lambda: not any(t.is_alive() for t in workers),
+    )
 
 
 def test_threadpool_grow_while_stopping_is_refused(

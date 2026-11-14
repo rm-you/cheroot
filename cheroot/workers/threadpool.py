@@ -508,10 +508,12 @@ class ThreadPool:
             KeyboardInterrupt,
         )
 
+        # A thread of the pool that stops it waits for no thread: another
+        # one may be stopping the pool too, and waiting for this one
         current_thread = threading.current_thread()
+        if current_thread in threads:
+            threads = []
         for worker in threads:
-            if worker is current_thread:
-                continue
             remaining_time = timeout and endtime - time.time()
             try:
                 worker.join(remaining_time)

@@ -7,6 +7,7 @@ previous threads have exited, and stopping it no longer waits for room in a
 full connection queue. :py:meth:`ThreadPool.grow()
 <cheroot.workers.threadpool.ThreadPool.grow>` now raises
 :py:exc:`RuntimeError` while :py:meth:`ThreadPool.stop()
-<cheroot.workers.threadpool.ThreadPool.stop>` ends the pool's threads.
+<cheroot.workers.threadpool.ThreadPool.stop>` ends the pool's threads, and a
+worker that stops its own pool no longer waits for the other threads.
 
 -- by :user:`rm-you`
