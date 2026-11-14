@@ -321,12 +321,13 @@ class ThreadPool:
         self._queue_put_timeout = accepted_queue_timeout
         self.get = self._queue.get
         # Guards the requests of shrink() that no thread has taken yet,
-        # whose shutdowns are due, which threads take them, and the pool's
-        # run: stop() ends a run, and the threads of the runs it ended
-        # shut down on a stop request
+        # whose shutdowns are due, which threads take them, the pool's run
+        # (stop() ends a run, and the threads of the runs it ended shut
+        # down on a stop request), and the stop() calls under way
         self._lock = threading.Lock()
         self._shutdowns_due = set()
         self._run = 0
+        self._stopping = set()
 
     def start(self):
         """Start the pool of threads.
@@ -336,7 +337,7 @@ class ThreadPool:
         with self._lock:
             # Forget the threads that have exited since stop()
             self._threads[:] = [t for t in self._threads if t.ready]
-            if self._threads:
+            if self._threads or self._stopping:
                 raise RuntimeError('Threadpools can only be started once.')
             self._grow(self.min)
 
@@ -380,9 +381,9 @@ class ThreadPool:
         :raises RuntimeError: while stop() ends the threads
         """
         with self._lock:
-            # A new thread could take the stop request that one of them
-            # still needs
-            if any(
+            # stop() would not know of a new thread, which could also take
+            # the stop request that one of the old ones still needs
+            if self._stopping or any(
                 t.ready and t._run != self._run and not t._retiring
                 for t in self._threads
             ):
@@ -488,26 +489,32 @@ class ThreadPool:
         else:
             endtime = time.time() + timeout
 
-        with self._lock:
-            # End the run. The shutdowns that shrink() asked for are no
-            # longer due, and every thread that has not taken a request,
-            # of this run or of a stop() that was interrupted, needs one.
-            self._run += 1
-            self._shutdowns_due.clear()
-            threads = [t for t in self._threads if t.is_alive()]
-            n_running = len([t for t in threads if not t._retiring])
+        stopping = object()
+        try:
+            with self._lock:
+                # This call is under way until it returns
+                self._stopping.add(stopping)
+                # End the run. The shutdowns that shrink() asked for are no
+                # longer due, and every thread that has not taken a request,
+                # of this run or of a stop() that was interrupted, needs one.
+                self._run += 1
+                self._shutdowns_due.clear()
+                threads = [t for t in self._threads if t.is_alive()]
+                n_running = len([t for t in threads if not t._retiring])
 
-        # Must shut down threads here so the code that calls
-        # this method can know when all threads are stopped.
-        for _ in range(n_running):
-            self._queue.put_shutdown(_SHUTDOWNREQUEST)
+            # Must shut down threads here so the code that calls
+            # this method can know when all threads are stopped.
+            for _ in range(n_running):
+                self._queue.put_shutdown(_SHUTDOWNREQUEST)
 
-        self._wait_for(threads, timeout, endtime)
-
-        with self._lock:
-            # A thread still running, even this one, keeps the pool from
-            # starting again: a new thread could take its stop request
-            self._threads[:] = [t for t in self._threads if t.ready]
+            self._wait_for(threads, timeout, endtime)
+        finally:
+            with self._lock:
+                self._stopping.discard(stopping)
+                # A thread still running, even this one, keeps the pool
+                # from starting again: a new thread could take its stop
+                # request
+                self._threads[:] = [t for t in self._threads if t.ready]
 
     def _wait_for(self, threads, timeout, endtime):
         """Wait for threads to exit, closing connections after the timeout."""

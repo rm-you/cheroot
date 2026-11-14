@@ -1749,6 +1749,53 @@ def test_threadpool_restart_waits_for_a_worker_that_stopped_it(
     assert pool.idle == pool.min
 
 
+def test_threadpool_grow_is_refused_until_stop_returns(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread grown while stop() waits for old ones would outlive it."""
+    with _hold_retiring_workers(monkeypatch) as at_exit:
+        pool = _pool_of_daemon_threads(request, minthreads=1)
+        stopper = threading.Thread(target=pool.stop, daemon=True)
+        stopper.start()
+        # The old thread took its stop request, but has not exited yet
+        assert at_exit.get(timeout=10)
+        with pytest.raises(RuntimeError, match='while it stops'):
+            pool.grow(3)
+    _join_thread(stopper)
+    assert not any(t.is_alive() for t in pool._threads)
+
+
+def test_threadpool_start_is_refused_until_stop_returns(
+    single_thread_pool: ThreadPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pool started again before stop() returns would outlive it."""
+    pool = single_thread_pool
+    worker = pool._threads[0]
+    exited = threading.Event()
+    resume = threading.Event()
+    original_join = worker.join
+
+    def _join_then_hold(timeout: float | None = None) -> None:
+        original_join(timeout)
+        exited.set()
+        assert resume.wait(10)
+
+    monkeypatch.setattr(worker, 'join', _join_then_hold)
+    stopper = threading.Thread(target=pool.stop, daemon=True)
+    with contextlib.ExitStack() as cleanup:
+        cleanup.callback(_join_thread, stopper)
+        cleanup.callback(resume.set)
+        stopper.start()
+        # The old thread has exited, but stop() has not returned
+        assert exited.wait(10)
+        with pytest.raises(RuntimeError, match='only be started once'):
+            pool.start()
+    pool.start()
+    assert len(pool._threads) == pool.min
+
+
 def test_threadpool_grow_while_stopping_is_refused(
     single_thread_pool: ThreadPool,
     monkeypatch: pytest.MonkeyPatch,

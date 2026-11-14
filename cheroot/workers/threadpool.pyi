@@ -39,6 +39,7 @@ class ThreadPool:
     _lock: threading.Lock
     _shutdowns_due: set[_ShrinkRequest]
     _run: int
+    _stopping: set[object]
     def __init__(
         self,
         server,
